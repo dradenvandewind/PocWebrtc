@@ -31,7 +31,7 @@ def check_plugins():
     missing = [p for p in needed
                if Gst.Registry.get().find_plugin(p) is None]
     if missing:
-        print(f"[ERREUR] Plugins manquants : {missing}")
+        print(f"[ERROR] Missing plugins: {missing}")
         return False
     return True
 
@@ -50,7 +50,7 @@ class WebRTCClient:
         self.pipe   = Gst.parse_launch(PIPELINE_DESC)
         self.webrtc = self.pipe.get_by_name("sendrecv")
         if self.webrtc is None:
-            raise RuntimeError("webrtcbin 'sendrecv' introuvable")
+            raise RuntimeError("webrtcbin 'sendrecv' not found")
 
         self.webrtc.connect("on-negotiation-needed", self._on_negotiation_needed)
         self.webrtc.connect("on-ice-candidate",      self._on_ice_candidate)
@@ -61,7 +61,15 @@ class WebRTCClient:
         bus.connect("message", self._on_bus_message)
 
         self.pipe.set_state(Gst.State.PLAYING)
-        print("[GST] Pipeline démarré")
+        print("[GST] Pipeline started")
+
+    def _stop_pipeline(self):
+        """Stop and destroy the GStreamer pipeline cleanly."""
+        if self.pipe:
+            print("[GST] Stopping pipeline…")
+            self.pipe.set_state(Gst.State.NULL)
+            self.pipe   = None
+            self.webrtc = None
 
     def _on_pad_added(self, element, pad):
         try:
@@ -95,7 +103,7 @@ class WebRTCClient:
 
     def _on_offer_created(self, promise, element, _):
         if promise.wait() != Gst.PromiseResult.REPLIED:
-            print("[ERREUR] create-offer : promise non répondue")
+            print("[ERROR] create-offer: promise not replied")
             return
         reply = promise.get_reply()
         offer = reply["offer"]
@@ -105,7 +113,7 @@ class WebRTCClient:
         p.interrupt()
 
         sdp_text = offer.sdp.as_text()
-        print(f"[GST] Offer SDP prête ({len(sdp_text)} chars)")
+        print(f"[GST] Offer SDP ready ({len(sdp_text)} chars)")
 
         self._loop.call_soon_threadsafe(
             self._q.put_nowait,
@@ -116,7 +124,7 @@ class WebRTCClient:
         print("[GST] Answer → set-remote-description")
         res, sdp = GstSdp.SDPMessage.new_from_text(sdp_text)
         if res != GstSdp.SDPResult.OK:
-            print(f"[ERREUR] Parsing SDP answer: {res}")
+            print(f"[ERROR] Parsing SDP answer: {res}")
             return
         answer = GstWebRTC.WebRTCSessionDescription.new(
             GstWebRTC.WebRTCSDPType.ANSWER, sdp
@@ -139,7 +147,7 @@ class WebRTCClient:
     # ── WebSocket ─────────────────────────────────────────────────────────
 
     def _flush_queue(self):
-        """Clear ICE/offer messages from the previous WS session."""
+        """Flush expired ICE/offer messages from the queue."""
         n = 0
         while not self._q.empty():
             try:
@@ -148,7 +156,19 @@ class WebRTCClient:
             except asyncio.QueueEmpty:
                 break
         if n:
-            print(f"[WS] {n} messages périmés vidés de la queue")
+            print(f"[WS] {n} expired messages flushed from queue")
+
+    async def _restart_pipeline(self):
+        """Destroy and recreate the GStreamer pipeline.
+        This is necessary because webrtcbin does not support re-negotiation
+        from the 'stable' state without recreating the object.
+        """
+        print("[GST] Restart pipeline for new session…")
+        self._stop_pipeline()
+        self._flush_queue()
+        await asyncio.sleep(0.3)   # allow GStreamer to release resources
+        self.start_pipeline()
+        print("[GST] Pipeline restarted — new offer in progress")
 
     async def _writer(self):
         while True:
@@ -158,11 +178,10 @@ class WebRTCClient:
                 await self.ws.send(json.dumps(msg))
             except (websockets.exceptions.ConnectionClosedError,
                     websockets.exceptions.ConnectionClosedOK) as e:
-                print(f"[WS] Fermé pendant envoi: {e}")
-                # Do not requeue — we will re-negotiate on reconnect
+                print(f"[WS] Closed during send: {e}")
                 break
             except Exception as e:
-                print(f"[WS] Erreur envoi {msg.get('type')}: {e}")
+                print(f"[WS] Send error {msg.get('type')}: {e}")
                 break
 
     async def _listener(self):
@@ -171,14 +190,15 @@ class WebRTCClient:
             msg_type = data.get("type")
             print(f"[WS←] {msg_type}")
             if msg_type == "offer":
-                print("[WS] Offer ignorée (notre propre offer renvoyée)")
+                print("[WS] Offer ignored (own offer echoed back)")
             elif msg_type == "answer":
                 self._handle_answer(data["sdp"])
             elif msg_type == "ice":
                 self._handle_ice(data["candidate"], data["sdpMLineIndex"])
             elif msg_type == "request_offer":
-                print("[WS] request_offer → re-négociation")
-                self._on_negotiation_needed(self.webrtc)
+                print("[WS] request_offer → full restart pipeline")
+                # Do not await here to avoid blocking the listener
+                asyncio.ensure_future(self._restart_pipeline())
 
     async def run(self):
         self._loop = asyncio.get_running_loop()
@@ -189,16 +209,16 @@ class WebRTCClient:
         first_connect = True
         while True:
             try:
-                print(f"[WS] Connexion à {SIGNALING_SERVER}…")
+                print(f"[WS] Connecting to {SIGNALING_SERVER}…")
                 self.ws = await websockets.connect(SIGNALING_SERVER)
-                print("[WS] Connecté")
+                print("[WS] Connected")
 
                 if not first_connect:
-                    # On each reconnect: clear old messages and
-                    # create a fresh offer for this session
+                    # WS reconnection (e.g., signaling restarted):
+                    # recreate the pipeline to generate a fresh offer
                     self._flush_queue()
-                    print("[WS] Re-négociation pour nouvelle session")
-                    self._on_negotiation_needed(self.webrtc)
+                    print("[WS] Reconnecting — restart pipeline")
+                    await self._restart_pipeline()
                 first_connect = False
 
                 writer_task   = asyncio.create_task(self._writer())
@@ -217,12 +237,12 @@ class WebRTCClient:
                 for t in done:
                     exc = t.exception()
                     if exc:
-                        print(f"[WS] Task erreur: {exc}")
+                        print(f"[WS] Task error: {exc}")
 
             except (OSError, websockets.exceptions.WebSocketException) as e:
-                print(f"[WS] Erreur connexion: {e}")
+                print(f"[WS] Connection error: {e}")
 
-            print("[WS] Retry dans 3s…")
+            print("[WS] Retry in 3s…")
             await asyncio.sleep(3)
 
 

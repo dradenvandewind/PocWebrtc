@@ -43,7 +43,7 @@ Tested on:
 
 ### Reconnection Handling
 
-When the WebRTC connection is lost, automatic reconnection is not yet implemented.
+When the WebRTC connection is lost, automatic reconnection is not yet implemented.   Fix !
 
 **TODO:** Implement reliable reconnection and session recovery.
 etc

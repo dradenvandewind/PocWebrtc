@@ -37,10 +37,10 @@
 
   <div id="url-bar">
     <input id="wsUrl" type="text" placeholder="ws://HOST:8765" />
-    <button onclick="reconnect()">Connecter</button>
+    <button onclick="reconnect()">Connect</button>
   </div>
 
-  <div class="status info" id="status">Initialisation…</div><br>
+  <div class="status info" id="status">Initializing…</div><br>
   <video id="video" autoplay playsinline controls></video>
   <div class="log" id="log"></div>
 
@@ -50,10 +50,9 @@
     const logEl    = document.getElementById("log");
     const wsUrlEl  = document.getElementById("wsUrl");
 
-    // Valeur par défaut de l'URL signaling
     wsUrlEl.value = `ws://${location.hostname || "localhost"}:8765`;
 
-    // ── Logging ──────────────────────────────────────────────────────────────
+    // ── Logging ───────────────────────────────────────────────────────────────
     function log(msg, level) {
       const ts   = new Date().toISOString().slice(11, 19);
       const line = document.createElement("div");
@@ -89,8 +88,8 @@
       });
 
       pc.ontrack = (ev) => {
-        setStatus("🎥 Stream reçu !", "ok");
-        log("Track reçue : kind=" + ev.track.kind, "ok");
+        setStatus("🎥 Stream received!", "ok");
+        log("Track received: kind=" + ev.track.kind, "ok");
         if (ev.streams && ev.streams[0]) {
           videoEl.srcObject = ev.streams[0];
         } else {
@@ -101,19 +100,24 @@
 
       pc.onicecandidate = (ev) => {
         if (ev.candidate) {
-          log("ICE local → sender");
-          wsSend({ type: "ice",
-                   candidate: ev.candidate.candidate,
-                   sdpMLineIndex: ev.candidate.sdpMLineIndex });
+          // Ignore mDNS candidates that are not resolvable outside the LAN
+          if (ev.candidate.candidate.includes('.local')) return;
+          wsSend({
+            type:          "ice",
+            candidate:     ev.candidate.candidate,
+            sdpMLineIndex: ev.candidate.sdpMLineIndex,
+            sdpMid:        ev.candidate.sdpMid,
+          });
+          log("ICE sent ✓");
         }
       };
 
       pc.onconnectionstatechange = () => {
         const s = pc.connectionState;
         log("PC state: " + s);
-        if (s === "connected")       setStatus("✅ Connexion WebRTC établie", "ok");
-        else if (s === "failed")     { setStatus("❌ ICE failed — relance dans 4s", "err"); setTimeout(connect, 4000); }
-        else if (s === "disconnected") setStatus("⚠️ Connexion interrompue…", "warn");
+        if (s === "connected")         setStatus("✅ WebRTC connection established", "ok");
+        else if (s === "failed")       { setStatus("❌ ICE failed — retry in 4s", "err"); setTimeout(connect, 4000); }
+        else if (s === "disconnected") setStatus("⚠️ Connection interrupted…", "warn");
       };
 
       pc.oniceconnectionstatechange = () => log("ICE: " + pc.iceConnectionState);
@@ -138,7 +142,7 @@
       if (ws && ws.readyState === WebSocket.OPEN)
         ws.send(JSON.stringify(obj));
       else
-        log("wsSend: WS non prêt", "warn");
+        log("wsSend: WS not ready", "warn");
     }
 
     function reconnect() {
@@ -151,14 +155,15 @@
 
     function connect() {
       const url = wsUrlEl.value.trim();
-      if (!url) { setStatus("Entrer une URL WebSocket", "warn"); return; }
+      if (!url) { setStatus("Enter a WebSocket URL", "warn"); return; }
 
-      setStatus("Connexion WS à " + url + "…", "warn");
+      setStatus("Connecting to " + url + "…", "warn");
       ws = new WebSocket(url);
 
       ws.onopen = () => {
-        setStatus("WebSocket connecté — attente de l'offer", "info");
-        createPC();
+        // Don't create PC here — wait for the offer so we create it fresh
+        // right before setRemoteDescription (avoids double-creation).
+        setStatus("WebSocket connected — waiting for offer…", "info");
       };
 
       ws.onerror = () => setStatus("WebSocket error — retry dans 3s", "err");
@@ -173,10 +178,10 @@
         const data = JSON.parse(ev.data);
 
         if (data.type === "offer") {
-          log("Offer reçue ✓");
-          setStatus("Offer reçue — négociation…", "warn");
+          log("Offer received ✓");
+          setStatus("Offer received — negotiating…", "warn");
 
-          // Recréer le PC à chaque nouvelle offer (reconnexion sender)
+          // Create (or re-create) the PC fresh for each offer
           createPC();
 
           await pc.setRemoteDescription({ type: "offer", sdp: data.sdp });
@@ -186,21 +191,23 @@
           await pc.setLocalDescription(answer);
           wsSend({ type: "answer", sdp: answer.sdp });
 
-          setStatus("Answer envoyé — ICE en cours…", "warn");
+          setStatus("Answer sent — ICE ongoing…", "warn");
 
         } else if (data.type === "ice") {
           if (!pc || !pc.remoteDescription) {
-            log("ICE reçu avant remoteDescription → buffer", "warn");
+            log("ICE received before remoteDescription → buffer", "warn");
             pendingCandidates.push({
-              candidate:    data.candidate,
+              candidate:     data.candidate,
               sdpMLineIndex: data.sdpMLineIndex,
+              sdpMid:        data.sdpMid,
             });
             return;
           }
           try {
             await pc.addIceCandidate({
-              candidate:    data.candidate,
+              candidate:     data.candidate,
               sdpMLineIndex: data.sdpMLineIndex,
+              sdpMid:        data.sdpMid,
             });
             log("ICE candidate ✓");
           } catch (e) {
