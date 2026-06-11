@@ -1,0 +1,57 @@
+version: "3.9"
+
+services:
+
+  # ── TURN server (coturn) ────────────────────────────────────────────────────
+  turn:
+    image: coturn/coturn
+    container_name: webrtc_turn
+    network_mode: host
+    command: >-
+      --no-tls
+      --no-dtls
+      --log-file=stdout
+      --min-port=49160
+      --max-port=49200
+      --realm=local
+      --fingerprint
+      --lt-cred-mech
+      --user=user:password
+    restart: unless-stopped
+
+  # ── Signaling server ────────────────────────────────────────────────────────
+  signaling:
+    build: .
+    container_name: webrtc_signaling
+    command: python3 signaling.py
+    ports:
+      - "8765:8765"
+    restart: unless-stopped
+
+  # ── GStreamer sender ────────────────────────────────────────────────────────
+  sender:
+    build: .
+    container_name: webrtc_sender
+    command: python3 webrtc_sender.py
+    environment:
+      - GST_DEBUG=3
+    depends_on:
+      - signaling
+
+    volumes:
+      - /dev:/dev:ro
+    devices:
+       - /dev/video0:/dev/video0
+    # group_add:
+    #   - "44"
+    restart: unless-stopped
+
+  # ── Serveur HTTP pour receiver.html ────────────────────────────────────────
+  web:
+    image: nginx:alpine
+    container_name: webrtc_web
+    volumes:
+      - ./receiver.html:/usr/share/nginx/html/index.html:ro
+    ports:
+      - "8081:80"
+    restart: unless-stopped

@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <title>GStreamer WebRTC Receiver</title>
+  <style>
+    body { font-family: sans-serif; background: #111; color: #eee; text-align: center; margin: 0; padding: 20px; }
+    h2   { color: #ccc; }
+    video {
+      width: 80%; max-width: 960px;
+      margin-top: 20px;
+      background: black;
+      border: 2px solid #333;
+      border-radius: 4px;
+    }
+    .status { margin: 12px auto; font-size: 1.1em; padding: 6px 12px;
+              display: inline-block; border-radius: 4px; }
+    .ok   { color: #0f0; background: #0a2a0a; }
+    .err  { color: #f66; background: #2a0a0a; }
+    .warn { color: #fa0; background: #2a1e00; }
+    .info { color: #8cf; background: #0a1a2a; }
+    #url-bar { margin: 14px auto; }
+    #url-bar input  { width: 320px; padding: 6px 10px; background: #222;
+                       color: #eee; border: 1px solid #555; border-radius: 3px; }
+    #url-bar button { padding: 6px 16px; cursor: pointer; border-radius: 3px;
+                       background: #334; color: #eee; border: 1px solid #556; }
+    #url-bar button:hover { background: #446; }
+    .log { text-align: left; max-width: 860px; margin: 14px auto;
+           background: #1a1a1a; padding: 10px 14px;
+           font-family: monospace; font-size: 0.78em;
+           height: 160px; overflow-y: auto;
+           border-radius: 4px; border: 1px solid #2a2a2a; }
+  </style>
+</head>
+<body>
+  <h2>WebRTC GStreamer Receiver</h2>
+
+  <div id="url-bar">
+    <input id="wsUrl" type="text" placeholder="ws://HOST:8765" />
+    <button onclick="reconnect()">Connecter</button>
+  </div>
+
+  <div class="status info" id="status">Initialisation…</div><br>
+  <video id="video" autoplay playsinline controls></video>
+  <div class="log" id="log"></div>
+
+  <script>
+    const statusEl = document.getElementById("status");
+    const videoEl  = document.getElementById("video");
+    const logEl    = document.getElementById("log");
+    const wsUrlEl  = document.getElementById("wsUrl");
+
+    // Valeur par défaut de l'URL signaling
+    wsUrlEl.value = `ws://${location.hostname || "localhost"}:8765`;
+
+    // ── Logging ──────────────────────────────────────────────────────────────
+    function log(msg, level) {
+      const ts   = new Date().toISOString().slice(11, 19);
+      const line = document.createElement("div");
+      line.style.color = level === "err"  ? "#f88"
+                       : level === "warn" ? "#fa0"
+                       : level === "ok"   ? "#6f6"
+                       :                    "#9ac";
+      line.textContent = `[${ts}] ${msg}`;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setStatus(msg, level) {
+      statusEl.textContent = msg;
+      statusEl.className = "status " + (level || "info");
+      log(msg, level);
+    }
+
+    // ── RTCPeerConnection ─────────────────────────────────────────────────────
+    let pc = null;
+    let pendingCandidates = [];
+
+    function createPC() {
+      if (pc) { try { pc.close(); } catch(_) {} }
+      pendingCandidates = [];
+
+      const TURN_HOST = location.hostname || "localhost";
+      pc = new RTCPeerConnection({
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          { urls: `turn:${TURN_HOST}:3478`, username: "user", credential: "password" },
+        ],
+      });
+
+      pc.ontrack = (ev) => {
+        setStatus("🎥 Stream reçu !", "ok");
+        log("Track reçue : kind=" + ev.track.kind, "ok");
+        if (ev.streams && ev.streams[0]) {
+          videoEl.srcObject = ev.streams[0];
+        } else {
+          if (!videoEl.srcObject) videoEl.srcObject = new MediaStream();
+          videoEl.srcObject.addTrack(ev.track);
+        }
+      };
+
+      pc.onicecandidate = (ev) => {
+        if (ev.candidate) {
+          log("ICE local → sender");
+          wsSend({ type: "ice",
+                   candidate: ev.candidate.candidate,
+                   sdpMLineIndex: ev.candidate.sdpMLineIndex });
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        const s = pc.connectionState;
+        log("PC state: " + s);
+        if (s === "connected")       setStatus("✅ Connexion WebRTC établie", "ok");
+        else if (s === "failed")     { setStatus("❌ ICE failed — relance dans 4s", "err"); setTimeout(connect, 4000); }
+        else if (s === "disconnected") setStatus("⚠️ Connexion interrompue…", "warn");
+      };
+
+      pc.oniceconnectionstatechange = () => log("ICE: " + pc.iceConnectionState);
+
+      return pc;
+    }
+
+    async function drainPending() {
+      for (const c of pendingCandidates) {
+        try   { await pc.addIceCandidate(c); log("ICE buffered ✓"); }
+        catch (e) { log("ICE buffered err: " + e, "err"); }
+      }
+      pendingCandidates = [];
+    }
+
+    // ── WebSocket ─────────────────────────────────────────────────────────────
+    let ws = null;
+    let retryTimer = null;
+    let shouldRetry = true;
+
+    function wsSend(obj) {
+      if (ws && ws.readyState === WebSocket.OPEN)
+        ws.send(JSON.stringify(obj));
+      else
+        log("wsSend: WS non prêt", "warn");
+    }
+
+    function reconnect() {
+      shouldRetry = false;
+      clearTimeout(retryTimer);
+      if (ws) { ws.onclose = null; try { ws.close(); } catch(_) {} }
+      shouldRetry = true;
+      connect();
+    }
+
+    function connect() {
+      const url = wsUrlEl.value.trim();
+      if (!url) { setStatus("Entrer une URL WebSocket", "warn"); return; }
+
+      setStatus("Connexion WS à " + url + "…", "warn");
+      ws = new WebSocket(url);
+
+      ws.onopen = () => {
+        setStatus("WebSocket connecté — attente de l'offer", "info");
+        createPC();
+      };
+
+      ws.onerror = () => setStatus("WebSocket error — retry dans 3s", "err");
+
+      ws.onclose = () => {
+        if (!shouldRetry) return;
+        setStatus("WebSocket fermé — retry dans 3s", "err");
+        retryTimer = setTimeout(connect, 3000);
+      };
+
+      ws.onmessage = async (ev) => {
+        const data = JSON.parse(ev.data);
+
+        if (data.type === "offer") {
+          log("Offer reçue ✓");
+          setStatus("Offer reçue — négociation…", "warn");
+
+          // Recréer le PC à chaque nouvelle offer (reconnexion sender)
+          createPC();
+
+          await pc.setRemoteDescription({ type: "offer", sdp: data.sdp });
+          await drainPending();
+
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          wsSend({ type: "answer", sdp: answer.sdp });
+
+          setStatus("Answer envoyé — ICE en cours…", "warn");
+
+        } else if (data.type === "ice") {
+          if (!pc || !pc.remoteDescription) {
+            log("ICE reçu avant remoteDescription → buffer", "warn");
+            pendingCandidates.push({
+              candidate:    data.candidate,
+              sdpMLineIndex: data.sdpMLineIndex,
+            });
+            return;
+          }
+          try {
+            await pc.addIceCandidate({
+              candidate:    data.candidate,
+              sdpMLineIndex: data.sdpMLineIndex,
+            });
+            log("ICE candidate ✓");
+          } catch (e) {
+            log("ICE addIceCandidate: " + e, "err");
+          }
+        }
+      };
+    }
+
+    connect();
+  </script>
+</body>
+</html>

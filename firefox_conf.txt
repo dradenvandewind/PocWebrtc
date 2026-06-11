@@ -1,0 +1,7 @@
+about:config
+
+media.peerconnection.ice.obfuscate_host_addresses   false
+
+
+open 
+http://localhost:8081/
